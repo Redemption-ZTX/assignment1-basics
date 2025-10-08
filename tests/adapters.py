@@ -3,11 +3,16 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
-
+import regex as re
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from multiprocessing import Pool
+from tqdm import tqdm
+
+
+from cs336_basics.pretokenization_example import get_chunks
 
 
 def run_linear(
@@ -559,7 +564,120 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    import regex
+    
+    class Tokenizer:
+        def __init__(self, vocab, merges, special_tokens):
+            self.vocab = vocab
+            self.merges = merges
+            self.special_tokens = special_tokens or []
+            self.inverse_vocab = {v: k for k, v in vocab.items()}
+            self.merge_ranks = {pair: i for i, pair in enumerate(merges)}
+            
+            if self.special_tokens:
+                # 特殊 token 按长度排序（长的优先匹配）
+                sorted_special = sorted(self.special_tokens, key=len, reverse=True)
+                # 转义特殊字符
+                escaped = [regex.escape(token) for token in sorted_special]
+                # 拼接特殊 token 模式
+                special_pattern = '|'.join(escaped)
+                # GPT-2 的基本模式
+                gpt2_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+                # 组合：特殊 token 优先
+                pattern_str = f"({special_pattern})|({gpt2_pattern})"
+                self.PAT = regex.compile(pattern_str, regex.IGNORECASE)
+            else:
+                # 没有特殊 token，只用 GPT-2 模式
+                gpt2_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+                self.PAT = regex.compile(gpt2_pattern, regex.IGNORECASE)
+            
+
+        def apply_bpe(self, token_bytes):
+            """Apply BPE merges to a bytes token and return list of token IDs."""
+            # 从单个字节开始
+            tokens = [bytes([b]) for b in token_bytes]
+            
+            while len(tokens) > 1:
+                # 找到优先级最高（rank 最小）的 pair
+                best_pair = None
+                best_rank = float('inf')
+                best_idx = -1
+
+                for i in range(len(tokens) - 1):
+                    pair = (tokens[i], tokens[i + 1])
+                    if pair in self.merge_ranks:
+                        rank = self.merge_ranks[pair]
+                        if rank < best_rank:
+                            best_rank = rank
+                            best_pair = pair
+                            best_idx = i
+                            
+                if best_pair is None:
+                    break
+                
+                merged = best_pair[0] + best_pair[1]
+                tokens = tokens[:best_idx] + [merged] + tokens[best_idx + 2:]
+        
+            return [self.inverse_vocab[token] for token in tokens]
+        
+        def encode(self, text):
+            if not text:
+                return []
+            
+            result = []
+            
+            # 如果有特殊 token，先用它们分割文本
+            if self.special_tokens:
+                # 构建分割 pattern
+                sorted_special = sorted(self.special_tokens, key=len, reverse=True)
+                escaped = [regex.escape(token) for token in sorted_special]
+                split_pattern = '(' + '|'.join(escaped) + ')'
+                
+                # 分割文本，保留分隔符
+                parts = regex.split(split_pattern, text)
+                
+                # GPT-2 pattern（不包含特殊 token）
+                gpt2_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+                gpt2_pat = regex.compile(gpt2_pattern)
+                
+                for part in parts:
+                    if not part:  # 跳过空字符串
+                        continue
+                    
+                    if part in self.special_tokens:
+                        # 特殊 token 直接查表
+                        chunk_bytes = part.encode('utf-8')
+                        if chunk_bytes in self.inverse_vocab:
+                            result.append(self.inverse_vocab[chunk_bytes])
+                    else:
+                        # 普通文本：用 GPT-2 pattern 分词并应用 BPE
+                        for match in gpt2_pat.finditer(part):
+                            chunk = match.group()
+                            chunk_bytes = chunk.encode('utf-8')
+                            result.extend(self.apply_bpe(chunk_bytes))
+            else:
+                # 没有特殊 token，直接用 GPT-2 pattern
+                for match in self.PAT.finditer(text):
+                    chunk = match.group()
+                    chunk_bytes = chunk.encode('utf-8')
+                    result.extend(self.apply_bpe(chunk_bytes))
+            
+            return result
+        
+        def decode(self, ids):
+            if not ids:
+                return ''
+            
+            bytes_data = b''.join(self.vocab[id] for id in ids)
+            return bytes_data.decode('utf-8', errors='replace')
+        
+        def encode_iterable(self, iterable):
+            for text in iterable:
+                for token_id in self.encode(text):
+                    yield token_id
+
+    return Tokenizer(vocab, merges, special_tokens)
+
 
 
 def run_train_bpe(
@@ -589,4 +707,104 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    # 1. 获取预分词结果和词频统计
+    num_processes = 4  # 小文件用少量进程
+    vocab_counts = get_chunks(input_path, num_processes, b"<|endoftext|>")
+    # vocab_counts: dict[tuple[bytes], int]
+    # 例如: {(b'h', b'e', b'l', b'l', b'o'): 5, ...}
+    
+    # 2. 计算需要进行多少次合并
+    num_merges = vocab_size - len(special_tokens) - 256
+    
+    # 3. 初始化 vocabulary: 256个单字节
+    vocab = {i: bytes([i]) for i in range(256)}
+    
+    # 4. 添加 special tokens
+    for i, special_token in enumerate(special_tokens):
+        vocab[256 + i] = special_token.encode('utf-8')
+    
+    # 5. BPE 训练循环（使用堆优化）
+    import heapq
+    merges = []
+    
+    # 5.0 初始化：统计所有 pairs 的频率
+    pair_counts = {}
+    for word, freq in vocab_counts.items():
+        word_len = len(word)
+        for i in range(word_len - 1):
+            pair = (word[i], word[i+1])
+            if pair in pair_counts:
+                pair_counts[pair] += freq
+            else:
+                pair_counts[pair] = freq
+    
+    for merge_idx in tqdm(range(num_merges)):
+        # 5.1 如果没有 pairs 可以合并，退出
+        if not pair_counts:
+            break
+        
+        # 5.2 找到频率最高的 pair（使用 max，考虑 tie-breaking）
+        # 频率最高，频率相同时字典序最大
+        best_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
+        
+        # 5.3 记录这次合并
+        merges.append(best_pair)
+        
+        # 5.4 将合并后的 token 添加到 vocabulary
+        new_token_id = 256 + len(special_tokens) + merge_idx
+        vocab[new_token_id] = best_pair[0] + best_pair[1]
+        
+        # 5.5 增量更新：在所有单词中执行合并，同时更新 pair_counts
+        new_vocab_counts = {}
+        new_token = best_pair[0] + best_pair[1]  # 合并后的新 token
+        
+        for word, freq in vocab_counts.items():
+            # 检查是否真正包含 best_pair（不仅仅是 best_pair[0]）
+            word_len = len(word)
+            contains_best_pair = False
+            for i in range(word_len - 1):
+                if (word[i], word[i+1]) == best_pair:
+                    contains_best_pair = True
+                    break
+            
+            if not contains_best_pair:
+                new_vocab_counts[word] = freq
+                continue
+            
+            # 在合并前，从 pair_counts 中减去这个单词贡献的旧 pairs
+            for i in range(word_len - 1):
+                old_pair = (word[i], word[i+1])
+                pair_counts[old_pair] -= freq
+                if pair_counts[old_pair] == 0:
+                    del pair_counts[old_pair]
+            
+            # 在 word 中查找并替换 best_pair
+            new_word = []
+            i = 0
+            while i < len(word):
+                if i < len(word) - 1 and (word[i], word[i+1]) == best_pair:
+                    new_word.append(new_token)  # 合并后的新 token
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            
+            new_word_tuple = tuple(new_word)
+            new_vocab_counts[new_word_tuple] = freq
+            
+            # 在合并后，向 pair_counts 中添加这个单词贡献的新 pairs
+            new_word_len = len(new_word)
+            for i in range(new_word_len - 1):
+                new_pair = (new_word[i], new_word[i+1])
+                if new_pair in pair_counts:
+                    pair_counts[new_pair] += freq
+                else:
+                    pair_counts[new_pair] = freq
+        
+        vocab_counts = new_vocab_counts
+    
+    return vocab, merges
+
+
+
+
