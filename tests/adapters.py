@@ -13,6 +13,12 @@ from tqdm import tqdm
 
 
 from cs336_basics.pretokenization_example import get_chunks
+###
+def run_relu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
+    """
+    Given the input features, compute the ReLU activation function.
+    """
+    raise NotImplementedError
 
 
 def run_linear(
